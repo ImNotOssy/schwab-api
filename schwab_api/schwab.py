@@ -17,8 +17,13 @@ class Schwab(SessionManager):
         """
         self.headless = kwargs.get("headless", True)
         self.browserType = kwargs.get("browserType", "firefox")
+        self.debug = kwargs.get("debug", False)
         self.session_cache = session_cache
         super(Schwab, self).__init__()
+
+    def log_debug(self, message):
+        if self.debug:
+            print(f"[SCHWAB-API DEBUG] {message}")
 
     def get_account_info(self):
         """
@@ -153,12 +158,14 @@ class Schwab(SessionManager):
             "CostBasis":"FIFO",
             }
 
+        self.log_debug(f"Legacy trade verification payload: {data}")
         r = self.session.post(urls.order_verification(), data)
 
         if r.status_code != 200:
             return [r.text], False
 
         response = json.loads(r.text)
+        self.log_debug(f"Legacy trade verification response: {response}")
 
         messages = list()
         for message in response["Messages"]:
@@ -186,6 +193,7 @@ class Schwab(SessionManager):
             "Timing": "Day Only"
         }
 
+        self.log_debug(f"Legacy trade execution payload: {data}")
         r = self.session.post(urls.order_confirmation(), data)
 
         if r.status_code != 200:
@@ -193,6 +201,7 @@ class Schwab(SessionManager):
             return messages, False
 
         response = json.loads(r.text)
+        self.log_debug(f"Legacy trade execution response: {response}")
         if response["ReturnCode"] == 0:
             return messages, True
 
@@ -290,6 +299,8 @@ class Schwab(SessionManager):
         else:
             raise Exception("side must be either Buy or Sell")
 
+        self.log_debug(f"trade_v2 called: {side} {qty} {ticker} for account {account_id}")
+
         # Handling formating of limit_price to avoid error.
         # Checking how many decimal places are in limit_price.
         decimal_places = len(str(float(limit_price)).split('.')[1])
@@ -340,11 +351,14 @@ class Schwab(SessionManager):
         # Adding this header seems to be necessary.
         self.headers['schwab-resource-version'] = '1.0'
 
+        self.log_debug(f"trade_v2 verification payload: {data}")
         r = requests.post(urls.order_verification_v2(), json=data, headers=self.headers)
         if r.status_code != 200:
             return [r.text], False
 
         response = json.loads(r.text)
+
+        self.log_debug(f"trade_v2 verification response: {response}")
 
         orderId = response['orderStrategy']['orderId']
         firstOrderLeg = response['orderStrategy']['orderLegs'][0]
@@ -359,7 +373,11 @@ class Schwab(SessionManager):
 
         # TODO: This needs to be fleshed out and clarified.
         if response["orderStrategy"]["orderReturnCode"] not in valid_return_codes:
-            return messages, False
+            # Fix: Allow "Cost Basis" warning (OE917) to pass even if it triggers a non-standard return code
+            if any("choose the cost basis method" in m for m in messages):
+                self.log_debug("Overriding return code failure due to known benign Cost Basis message.")
+            else:
+                return messages, False
 
         if dry_run:
             return messages, True
@@ -371,12 +389,14 @@ class Schwab(SessionManager):
         if affirm_order:
             data["OrderStrategy"]["OrderAffrmIn"] = True
         self.update_token(token_type='update')
+        self.log_debug(f"trade_v2 execution payload: {data}")
         r = requests.post(urls.order_verification_v2(), json=data, headers=self.headers)
 
         if r.status_code != 200:
             return [r.text], False
 
         response = json.loads(r.text)
+        self.log_debug(f"trade_v2 execution response: {response}")
 
         messages = list()
         if limit_price_warning is not None:
@@ -551,7 +571,11 @@ class Schwab(SessionManager):
 
         # TODO: This needs to be fleshed out and clarified.
         if response["orderStrategy"]["orderReturnCode"] not in valid_return_codes:
-            return messages, False
+            # Fix: Allow "Cost Basis" warning (OE917) to pass even if it triggers a non-standard return code
+            if any("choose the cost basis method" in m for m in messages):
+                self.log_debug("Overriding return code failure due to known benign Cost Basis message.")
+            else:
+                return messages, False
 
         if dry_run:
             return messages, True
@@ -686,6 +710,9 @@ class Schwab(SessionManager):
     def get_account_info_v2(self):
         account_info = dict()
         self.update_token(token_type='api')
+        # somewhere around 2025-08-25, this change became necessary
+        if 'schwab-client-account' in self.headers:
+            self.headers['Schwab-Client-Ids'] = self.headers['schwab-client-account']
         r = requests.get(urls.positions_v2(), headers=self.headers)
         response = json.loads(r.text)
         for account in response['accounts']:
@@ -694,18 +721,18 @@ class Schwab(SessionManager):
             for security_group in account["groupedPositions"]:
                 if security_group["groupName"] == "Cash":
                     continue
-                for position in security_group["positions"]:
-                    if "symbol" not in position["symbolDetail"]:
+                for position in security_group["holdingsRows"]:
+                    if "symbol" not in position:
                         valid_parse = False
                         break
                     positions.append(
                         Position(
-                            position["symbolDetail"]["symbol"],
-                            position["symbolDetail"]["description"],
-                            float(position["quantity"]),
-                            0 if "costDetail" not in position else float(position["costDetail"]["costBasisDetail"]["costBasis"]),
-                            0 if "priceDetail" not in position else float(position["priceDetail"]["marketValue"]),
-                            position["symbolDetail"]["schwabSecurityId"]
+                            position["symbol"]["symbol"],
+                            position["description"],
+                            float(position["qty"]["qty"]),
+                            0 if "costBasis" not in position else float(position["costBasis"]["cstBasis"]),
+                            0 if "marketValue" not in position else float(position["marketValue"]["val"]),
+                            position["symbol"]["ssId"]
                         )._as_dict()
                     )
             if not valid_parse:
